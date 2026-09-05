@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#111827" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>E3 Pro BLE · Solo lectura</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0b1020; color: #eef2ff; }
+    main { max-width: 720px; margin: 0 auto; padding: 20px 16px 48px; }
+    h1 { font-size: 1.55rem; margin: 0 0 8px; }
+    .sub { color: #b6c0d4; line-height: 1.45; margin-bottom: 18px; }
+    .card { background: #121a2e; border: 1px solid #26314f; border-radius: 16px; padding: 16px; margin: 12px 0; }
+    .status { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; align-items: center; }
+    .label { color: #aab5ca; }
+    .value { font-weight: 700; text-align: right; }
+    .ok { color: #7ee2a8; }
+    .warn { color: #ffd27d; }
+    .bad { color: #ff8f8f; }
+    button, .filebtn { width: 100%; border: 0; border-radius: 12px; min-height: 48px; padding: 12px 14px; font-weight: 700; font-size: 1rem; margin: 6px 0; }
+    button { background: #edf2ff; color: #101729; }
+    button.secondary { background: #26314f; color: #eef2ff; }
+    button:disabled { opacity: .45; }
+    input[type=file] { width: 100%; margin-top: 8px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #080d19; border-radius: 12px; padding: 12px; min-height: 120px; max-height: 340px; overflow: auto; }
+    .result { background: #080d19; border-radius: 12px; padding: 12px; margin-top: 8px; word-break: break-all; }
+    .result strong { display:block; margin-bottom:6px; }
+    .small { font-size: .86rem; color: #aab5ca; line-height: 1.45; }
+    .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#26314f; font-size:.78rem; font-weight:700; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Ninebot E3 Pro · BLE lector</h1>
+  <div class="sub">Herramienta privada de diagnóstico <b>solo lectura</b> para Bluefy/Web Bluetooth. No contiene comandos de escritura ni de flasheo.</div>
+
+  <section class="card">
+    <div class="status">
+      <span class="label">Web Bluetooth</span><span id="btSupport" class="value">comprobando…</span>
+      <span class="label">Credencial</span><span id="credStatus" class="value warn">no cargada</span>
+      <span class="label">Bluetooth</span><span id="bleStatus" class="value warn">desconectado</span>
+      <span class="label">Encryption2</span><span id="authStatus" class="value warn">sin autenticar</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="pill">1 · Credencial local</div>
+    <p class="small">Selecciona tu archivo <code>credencial_ninebot_*.json</code>. Se procesa únicamente en el iPhone y no se sube a ningún servidor. La contraseña nunca se muestra en pantalla ni se guarda en localStorage.</p>
+    <input id="credFile" type="file" accept="application/json,.json" />
+  </section>
+
+  <section class="card">
+    <div class="pill">2 · Conexión</div>
+    <button id="connectBtn" disabled>Conectar al E3 Pro</button>
+    <button id="authBtn" class="secondary" disabled>Autenticar Encryption2</button>
+    <p class="small">En el selector Bluetooth de Bluefy, elige tu patinete. Cierra antes Segway-Ninebot u otras apps que puedan estar conectadas al scooter.</p>
+  </section>
+
+  <section class="card">
+    <div class="pill">3 · Lecturas MCU</div>
+    <button id="uidBtn" disabled>Leer drv_uid · 0xDA · 12 bytes</button>
+    <button id="e4Btn" class="secondary" disabled>Leer drv_rand · 0xE4 · 6 bytes</button>
+    <button id="e7Btn" class="secondary" disabled>Leer drv_flag · 0xE7 · 2 bytes</button>
+    <div id="result" class="result"><strong>Resultado</strong>Sin lectura todavía.</div>
+  </section>
+
+  <section class="card">
+    <div class="pill">Registro</div>
+    <pre id="log">Listo.</pre>
+    <button id="clearBtn" class="secondary">Limpiar registro</button>
+  </section>
+
+  <p class="small">Este build no implementa <code>WRITE</code>, <code>WRITE_NR</code>, IAP, actualización de firmware ni cambio de velocidad. Servicio BLE esperado: Nordic UART <code>6e400001-…</code>.</p>
+</main>
+
+<script>
+'use strict';
+
+const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const WRITE_UUID   = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const NOTIFY_UUID  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const APP_ID = 0x3E, AUTH_TARGET = 0x21, MCU_TARGET = 0x20;
+const CMD_READ = 0x01, CMD_READ_ACK = 0x04, CMD_PRE_COMM = 0x5B, CMD_AUTH = 0x5D;
+const FW_DATA = hexToBytes('97 cf b8 02 84 41 43 de 56 00 2b 3b 34 78 0a 5d');
+
+let credential = null;
+let transport = null;
+let cryptoE2 = null;
+let authenticated = false;
+
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+function log(msg) {
+  const stamp = new Date().toLocaleTimeString();
+  logEl.textContent += `\n[${stamp}] ${msg}`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setState(el, text, cls='warn') { el.textContent = text; el.className = `value ${cls}`; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function concat(...parts) {
+  const n = parts.reduce((s,p)=>s+p.length,0), out = new Uint8Array(n);
+  let o=0; for (const p of parts) { out.set(p,o); o+=p.length; } return out;
+}
+function hexToBytes(s) {
+  s = s.replace(/[^0-9a-f]/gi,'');
+  if (s.length % 2) throw new Error('Hexadecimal inválido');
+  const out = new Uint8Array(s.length/2);
+  for (let i=0;i<out.length;i++) out[i]=parseInt(s.slice(i*2,i*2+2),16);
+  return out;
+}
+function bytesToHex(b) { return [...b].map(x=>x.toString(16).padStart(2,'0')).join(' '); }
+function asciiSafe(b) { return [...b].map(x => (x>=32 && x<=126) ? String.fromCharCode(x) : '.').join(''); }
+function eqBytes(a,b) { if (a.length!==b.length) return false; let x=0; for(let i=0;i<a.length;i++) x|=a[i]^b[i]; return x===0; }
+function xor16(a,b) { const o=new Uint8Array(16); for(let i=0;i<16;i++) o[i]=a[i]^b[i]; return o; }
+
+// AES-128 block encryption, self-contained. Only encryption is required by Encryption2.
+const SBOX = new Uint8Array([
+0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16]);
+const RCON = new Uint8Array([0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36]);
+function expandKey(key) {
+  if (key.length !== 16) throw new Error('AES requiere clave de 16 bytes');
+  const w = new Uint8Array(176); w.set(key);
+  let bytes=16, rcon=1, temp=new Uint8Array(4);
+  while(bytes<176){
+    temp.set(w.slice(bytes-4,bytes));
+    if(bytes%16===0){
+      const t=temp[0]; temp[0]=SBOX[temp[1]]^RCON[rcon++]; temp[1]=SBOX[temp[2]]; temp[2]=SBOX[temp[3]]; temp[3]=SBOX[t];
+    }
+    for(let i=0;i<4;i++){ w[bytes]=w[bytes-16]^temp[i]; bytes++; }
+  }
+  return w;
+}
+function xtime(x){ return ((x<<1) ^ ((x&0x80)?0x1b:0)) & 0xff; }
+function addRoundKey(s,w,r){ for(let i=0;i<16;i++) s[i]^=w[r*16+i]; }
+function subBytes(s){ for(let i=0;i<16;i++) s[i]=SBOX[s[i]]; }
+function shiftRows(s){
+  const t=s.slice();
+  s[0]=t[0]; s[4]=t[4]; s[8]=t[8]; s[12]=t[12];
+  s[1]=t[5]; s[5]=t[9]; s[9]=t[13]; s[13]=t[1];
+  s[2]=t[10]; s[6]=t[14]; s[10]=t[2]; s[14]=t[6];
+  s[3]=t[15]; s[7]=t[3]; s[11]=t[7]; s[15]=t[11];
+}
+function mixColumns(s){
+  for(let c=0;c<4;c++){
+    const i=c*4, a0=s[i],a1=s[i+1],a2=s[i+2],a3=s[i+3];
+    const t=a0^a1^a2^a3, u=a0;
+    s[i]   ^= t ^ xtime(a0^a1);
+    s[i+1] ^= t ^ xtime(a1^a2);
+    s[i+2] ^= t ^ xtime(a2^a3);
+    s[i+3] ^= t ^ xtime(a3^u);
+  }
+}
+function aesBlock(key,block){
+  if(block.length!==16) throw new Error('AES block debe tener 16 bytes');
+  const s=new Uint8Array(block), w=expandKey(key);
+  addRoundKey(s,w,0);
+  for(let r=1;r<=9;r++){ subBytes(s); shiftRows(s); mixColumns(s); addRoundKey(s,w,r); }
+  subBytes(s); shiftRows(s); addRoundKey(s,w,10); return s;
+}
+
+async function sha1(bytes) {
+  const out = await crypto.subtle.digest('SHA-1', bytes);
+  return new Uint8Array(out);
+}
+async function deriveKey(k1,k2){
+  const a=new Uint8Array(16), b=new Uint8Array(16);
+  a.set(k1.slice(0,16)); if(k2) b.set(k2.slice(0,16));
+  return (await sha1(concat(a,b))).slice(0,16);
+}
+function nonce(counter,auth){
+  const o=new Uint8Array(13); const v=new DataView(o.buffer);
+  v.setUint32(0,counter>>>0,false); o.set(auth.slice(0,8),4); o[12]=0; return o;
+}
+function aBlock(n,nBlock){ return concat(new Uint8Array([1]),n,new Uint8Array([0,nBlock&0xff])); }
+function ctrXor(key,data,n){
+  const out=new Uint8Array(data.length);
+  for(let off=0;off<data.length;off+=16){
+    const stream=aesBlock(key,aBlock(n,1+Math.floor(off/16)));
+    const chunk=data.slice(off,off+16);
+    for(let i=0;i<chunk.length;i++) out[off+i]=chunk[i]^stream[i];
+  }
+  return out;
+}
+function mac(key,plaintext,n){
+  const payloadLen=plaintext.length-3;
+  let x=aesBlock(key,concat(new Uint8Array([0x59]),n,new Uint8Array([0,payloadLen&0xff])));
+  const aad=new Uint8Array(16); aad.set(plaintext.slice(0,3));
+  x=aesBlock(key,xor16(x,aad));
+  const payload=plaintext.slice(3);
+  for(let off=0;off<payload.length;off+=16){
+    const block=new Uint8Array(16); block.set(payload.slice(off,off+16));
+    x=aesBlock(key,xor16(x,block));
+  }
+  return x.slice(0,4);
+}
+
+class CryptoE2 {
+  constructor(){ this.key1=new Uint8Array(); this.key2=null; this.auth=new Uint8Array(16); this.counter=0; }
+  setKey(k1,k2){ this.key1=new Uint8Array(k1); this.key2=k2?new Uint8Array(k2):null; }
+  setAuth(a){ this.auth=new Uint8Array(16); this.auth.set(a.slice(0,16)); }
+  startCounter(){ this.counter=1; }
+  async encrypt(plain){
+    const key=await deriveKey(this.key1,this.key2), header=plain.slice(0,3), payload=plain.slice(3);
+    if(this.counter===0){
+      let sum=0; for(const x of payload) sum=(sum+x)&0xffff;
+      const checksum=(~sum)&0xffff, stream=aesBlock(key,FW_DATA), enc=new Uint8Array(payload.length);
+      for(let off=0;off<payload.length;off+=16){ const chunk=payload.slice(off,off+16); for(let i=0;i<chunk.length;i++) enc[off+i]=chunk[i]^stream[i]; }
+      return concat(header,enc,new Uint8Array([0,0,checksum&0xff,(checksum>>>8)&0xff,0,0]));
+    }
+    this.counter=(this.counter+1)>>>0;
+    const n=nonce(this.counter,this.auth), cipher=ctrXor(key,payload,n), rawTag=mac(key,plain,n), tagStream=aesBlock(key,aBlock(n,0));
+    const tag=new Uint8Array(4); for(let i=0;i<4;i++) tag[i]=rawTag[i]^tagStream[i];
+    return concat(header,cipher,tag,new Uint8Array([(this.counter>>>8)&0xff,this.counter&0xff]));
+  }
+  async decrypt(frameBytes){
+    if(frameBytes.length<13) return {plain:frameBytes,valid:false};
+    const key=await deriveKey(this.key1,this.key2), header=frameBytes.slice(0,3), body=frameBytes.slice(3,-6), tail=frameBytes.slice(-6);
+    const recvCounter=(tail[4]<<8)|tail[5];
+    if(recvCounter===0){
+      const stream=aesBlock(key,FW_DATA), bodyPlain=new Uint8Array(body.length);
+      for(let off=0;off<body.length;off+=16){ const chunk=body.slice(off,off+16); for(let i=0;i<chunk.length;i++) bodyPlain[off+i]=chunk[i]^stream[i]; }
+      const plain=concat(header,bodyPlain); let sum=0; for(const x of plain.slice(3)) sum=(sum+x)&0xffff;
+      const checksum=(~sum)&0xffff, received=tail[2]|(tail[3]<<8);
+      return {plain,valid:checksum===received};
+    }
+    const n=nonce(recvCounter,this.auth), plain=concat(header,ctrXor(key,body,n)), tagStream=aesBlock(key,aBlock(n,0));
+    const receivedTag=new Uint8Array(4); for(let i=0;i<4;i++) receivedTag[i]=tail[i]^tagStream[i];
+    const valid=eqBytes(receivedTag,mac(key,plain,n));
+    if(valid && recvCounter>this.counter) this.counter=recvCounter;
+    return {plain,valid};
+  }
+}
+
+function buildFrame(target,cmd,index=0,data=new Uint8Array()){
+  return concat(new Uint8Array([0x5A,0xA5,data.length,APP_ID,target,cmd,index]),data);
+}
+function parsePacket(plain){
+  if(plain.length<7 || plain[0]!==0x5a || plain[1]!==0xa5) throw new Error('Respuesta sin formato Protocol 2');
+  const length=plain[2]; if(plain.length<7+length) throw new Error('Respuesta incompleta');
+  return {source:plain[3],target:plain[4],cmd:plain[5],index:plain[6],payload:plain.slice(7,7+length)};
+}
+
+class BleTransport {
+  constructor(device,writeChar,notifyChar){ this.device=device; this.writeChar=writeChar; this.notifyChar=notifyChar; this.buffer=new Uint8Array(); this.queue=[]; this.waiters=[]; this.onNotify=this.onNotify.bind(this); }
+  async start(){ await this.notifyChar.startNotifications(); this.notifyChar.addEventListener('characteristicvaluechanged',this.onNotify); }
+  stop(){ try{this.notifyChar.removeEventListener('characteristicvaluechanged',this.onNotify);}catch{} }
+  onNotify(ev){
+    const dv=ev.target.value, part=new Uint8Array(dv.buffer,dv.byteOffset,dv.byteLength);
+    this.buffer=concat(this.buffer,part);
+    while(this.buffer.length>=3){
+      let start=-1; for(let i=0;i<this.buffer.length-1;i++){ if(this.buffer[i]===0x5a&&this.buffer[i+1]===0xa5){start=i;break;} }
+      if(start<0){ this.buffer=new Uint8Array(); return; }
+      if(start>0) this.buffer=this.buffer.slice(start);
+      if(this.buffer.length<3) return;
+      const total=this.buffer[2]+13; if(this.buffer.length<total) return;
+      const packet=this.buffer.slice(0,total); this.buffer=this.buffer.slice(total); this.push(packet);
+    }
+  }
+  push(packet){ if(this.waiters.length){ const w=this.waiters.shift(); clearTimeout(w.timer); w.resolve(packet); } else this.queue.push(packet); }
+  discard(){ this.queue.length=0; }
+  async send(packet){
+    for(let off=0;off<packet.length;off+=20){
+      const chunk=packet.slice(off,off+20);
+      if(typeof this.writeChar.writeValueWithoutResponse==='function') await this.writeChar.writeValueWithoutResponse(chunk);
+      else if(typeof this.writeChar.writeValue==='function') await this.writeChar.writeValue(chunk);
+      else if(typeof this.writeChar.writeValueWithResponse==='function') await this.writeChar.writeValueWithResponse(chunk);
+      else throw new Error('Bluefy no expone un método de escritura GATT compatible');
+      await sleep(25);
+    }
+  }
+  receive(timeoutMs){
+    if(this.queue.length) return Promise.resolve(this.queue.shift());
+    return new Promise((resolve,reject)=>{
+      const waiter={resolve,reject,timer:null};
+      waiter.timer=setTimeout(()=>{ const i=this.waiters.indexOf(waiter); if(i>=0)this.waiters.splice(i,1); reject(new Error('TIMEOUT')); },timeoutMs);
+      this.waiters.push(waiter);
+    });
+  }
+}
+
+async function exchange(plain,timeoutMs,stage){
+  if(!transport||!cryptoE2) throw new Error('No hay sesión BLE');
+  transport.discard(); await transport.send(await cryptoE2.encrypt(plain));
+  let encrypted; try{ encrypted=await transport.receive(timeoutMs); }catch{ throw new Error(`TIMEOUT EN ${stage}`); }
+  const {plain:decoded,valid}=await cryptoE2.decrypt(encrypted);
+  if(!valid) throw new Error(`Falló la comprobación criptográfica en ${stage}`);
+  return parsePacket(decoded);
+}
+
+async function authenticate(){
+  if(!credential) throw new Error('Carga primero la credencial JSON');
+  if(!transport) throw new Error('Conecta primero el patinete');
+  authenticated=false; updateButtons(); setState($('authStatus'),'autenticando…','warn');
+  cryptoE2=new CryptoE2();
+  cryptoE2.setKey(new TextEncoder().encode(credential.device_name),FW_DATA);
+  log('PRE_COMM: enviando');
+  const pre=await exchange(buildFrame(AUTH_TARGET,CMD_PRE_COMM),10000,'PRE_COMM');
+  if(pre.target!==APP_ID || pre.cmd!==CMD_PRE_COMM || pre.payload.length<30) throw new Error('PRE_COMM no entregó una sesión válida');
+  log('PRE_COMM: válida');
+  const auth=pre.payload.slice(0,16), serial=pre.payload.slice(16,30);
+  cryptoE2.setAuth(auth); cryptoE2.startCounter(); cryptoE2.setKey(credential.password,auth);
+  log('AUTH: enviando');
+  const reply=await exchange(buildFrame(AUTH_TARGET,CMD_AUTH,0,serial),10000,'AUTH');
+  if(reply.target!==APP_ID || reply.cmd!==CMD_AUTH || reply.index!==1) throw new Error('AUTH fue rechazado');
+  authenticated=true; setState($('authStatus'),'válida','ok'); log('AUTH: válida'); updateButtons();
+}
+
+async function readRegister(index,length){
+  if(!authenticated) throw new Error('Primero autentica Encryption2');
+  const p=await exchange(buildFrame(MCU_TARGET,CMD_READ,index,new Uint8Array([length])),7000,`LECTURA 0x${index.toString(16).toUpperCase()}`);
+  if(p.source!==MCU_TARGET || p.target!==APP_ID || ![CMD_READ,CMD_READ_ACK].includes(p.cmd) || p.index!==index) throw new Error(`Respuesta inesperada al leer 0x${index.toString(16).toUpperCase()}`);
+  if(p.payload.length!==length) throw new Error(`0x${index.toString(16).toUpperCase()} devolvió ${p.payload.length} bytes; esperábamos ${length}`);
+  return p.payload;
+}
+
+function showResult(title,bytes,extra=''){
+  $('result').innerHTML='';
+  const strong=document.createElement('strong'); strong.textContent=title; $('result').appendChild(strong);
+  const line=document.createElement('div'); line.textContent=bytesToHex(bytes); $('result').appendChild(line);
+  if(extra){ const e=document.createElement('div'); e.className='small'; e.style.marginTop='8px'; e.textContent=extra; $('result').appendChild(e); }
+}
+
+async function connectBluetooth(){
+  if(!navigator.bluetooth) throw new Error('Web Bluetooth no está disponible. Abre esta web dentro de Bluefy, no Safari');
+  authenticated=false; setState($('authStatus'),'sin autenticar','warn');
+  const device=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SERVICE_UUID]});
+  device.addEventListener('gattserverdisconnected',()=>{ authenticated=false; transport?.stop(); transport=null; setState($('bleStatus'),'desconectado','warn'); setState($('authStatus'),'sin autenticar','warn'); log('Bluetooth desconectado'); updateButtons(); });
+  log(`Dispositivo seleccionado: ${maskName(device.name||'sin nombre')}`);
+  const server=await device.gatt.connect(); const service=await server.getPrimaryService(SERVICE_UUID);
+  const writeChar=await service.getCharacteristic(WRITE_UUID), notifyChar=await service.getCharacteristic(NOTIFY_UUID);
+  transport=new BleTransport(device,writeChar,notifyChar); await transport.start(); await sleep(750);
+  setState($('bleStatus'),'conectado','ok'); log('UART Nordic conectada; notificaciones activas'); updateButtons();
+  if(credential?.device_name && device.name && device.name!==credential.device_name) log('AVISO: el nombre BLE no coincide con la credencial cargada');
+}
+
+function maskName(name){ return name.length<=5?'***':name.slice(0,5)+'…'+name.slice(-2); }
+function updateButtons(){
+  $('connectBtn').disabled=!credential;
+  $('authBtn').disabled=!credential||!transport;
+  $('uidBtn').disabled=!authenticated; $('e4Btn').disabled=!authenticated; $('e7Btn').disabled=!authenticated;
+}
+
+$('credFile').addEventListener('change',async ev=>{
+  try{
+    const file=ev.target.files?.[0]; if(!file) return;
+    const data=JSON.parse(await file.text());
+    if(typeof data.device_name!=='string'||!data.device_name) throw new Error('Falta device_name');
+    if(typeof data.password_hex!=='string'||!/^[0-9a-fA-F]{32}$/.test(data.password_hex)) throw new Error('password_hex debe contener exactamente 16 bytes');
+    credential={device_name:data.device_name,password:hexToBytes(data.password_hex)};
+    setState($('credStatus'),maskName(credential.device_name),'ok'); log('Credencial local cargada y validada (contraseña oculta)'); updateButtons();
+  }catch(e){ credential=null; setState($('credStatus'),'inválida','bad'); log('ERROR credencial: '+e.message); updateButtons(); }
+});
+$('connectBtn').addEventListener('click',()=>connectBluetooth().catch(e=>{setState($('bleStatus'),'error','bad');log('ERROR conexión: '+e.message);}));
+$('authBtn').addEventListener('click',()=>authenticate().catch(e=>{authenticated=false;setState($('authStatus'),'falló','bad');log('ERROR AUTH: '+e.message);updateButtons();}));
+$('uidBtn').addEventListener('click',async()=>{try{log('Leyendo drv_uid 0xDA (12 bytes)'); const b=await readRegister(0xDA,12); showResult('drv_uid · 0xDA',b,`12 bytes · ${bytesToHex(b).replaceAll(' ','')}`); log('drv_uid: lectura OK');}catch(e){log('ERROR 0xDA: '+e.message);}});
+$('e4Btn').addEventListener('click',async()=>{try{log('Leyendo drv_rand 0xE4 (6 bytes)'); const b=await readRegister(0xE4,6); showResult('drv_rand · 0xE4',b,`ASCII: ${asciiSafe(b)}`); log('drv_rand: lectura OK');}catch(e){log('ERROR 0xE4: '+e.message);}});
+$('e7Btn').addEventListener('click',async()=>{try{log('Leyendo drv_flag 0xE7 (2 bytes)'); const b=await readRegister(0xE7,2); const v=b[0]|(b[1]<<8); showResult('drv_flag · 0xE7',b,`uint16 little-endian: ${v}`); log('drv_flag: lectura OK');}catch(e){log('ERROR 0xE7: '+e.message);}});
+$('clearBtn').addEventListener('click',()=>{logEl.textContent='Listo.';});
+
+if(navigator.bluetooth) setState($('btSupport'),'disponible','ok'); else setState($('btSupport'),'no disponible','bad');
+updateButtons();
+</script>
+</body>
+</html>
